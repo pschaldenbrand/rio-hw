@@ -58,7 +58,7 @@ class Zed(Node):
     def __init__(
         self,
         serial: int | str,
-        model: str,
+        model: str = "",
         resolution: tuple[int, int] | None = (720, 1280),
         resolution_depth: tuple[int, int] | None = None,
         enable_color: bool = True,

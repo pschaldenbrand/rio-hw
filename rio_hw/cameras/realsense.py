@@ -97,7 +97,8 @@ class Realsense(Node):
         self.enable_depth = enable_depth
         self.bgr = bgr
         self.advanced_mode_config = advanced_mode_config
-        self.timeout_ms = timeout_ms
+        # pyrealsense2 requires int (float fails pybind11 overload resolution).
+        self.timeout_ms = int(timeout_ms)
         self.dtype = dtype
         super().__init__(freq=freq, max_buffer_size=max_buffer_size, **kwargs)
 
@@ -136,11 +137,12 @@ class Realsense(Node):
         threadpool_limits(1)
         cv2.setNumThreads(1)
 
-        # Reset cameras to ensure they are in a good state before starting streaming.
+        # Reset only this camera; resetting every RealSense confuses parallel camera startup.
         ctx = rs.context()
-        devices = ctx.query_devices()
-        for dev in devices:
-            dev.hardware_reset()
+        for dev in ctx.query_devices():
+            if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                dev.hardware_reset()
+                break
         time.sleep(self.timeout_ms / 1000.0)
 
         fps = self.freq
