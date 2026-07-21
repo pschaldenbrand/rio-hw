@@ -46,6 +46,8 @@ class RobotiqTcpDriver:
         # Read request tracking
         self._last_read_time = 0
         self.read_interval = 1.0 / freq
+        self._last_successful_read_time: float | None = None
+        self._last_written_position_byte: int | None = None
 
         # Drain tracking
         self._last_drain_time = 0
@@ -259,6 +261,7 @@ class RobotiqTcpDriver:
 
                             # Byte 5: CURRENT
                             self.gCU = data[5]
+                            self._last_successful_read_time = time.time()
 
                 except TimeoutError:
                     pass  # No response, keep old values
@@ -267,6 +270,7 @@ class RobotiqTcpDriver:
                         self.sock.settimeout(old_timeout)
                 return
             except ConnectionError:
+                self._invalidate_socket()
                 if attempt + 1 < max_attempts:
                     time.sleep(0.02)
                     continue
@@ -274,31 +278,26 @@ class RobotiqTcpDriver:
 
     def _poll_input_registers_if_due(self) -> None:
         """Issue FC03 read at most once per ``read_interval`` (shared by ``update`` and ``state``)."""
-        if self.sock is None:
-            return
         now = time.time()
-        if (now - self._last_read_time) >= self.read_interval:
-            try:
-                self._read_input_registers()
-            except ConnectionError:
-                # UR socket bridges often drop the TCP session; do not kill the publisher thread.
-                # Cached register values are used until ``moveG``/``_write_output_registers`` opens
-                # a new connection.
-                pass
-            self._last_read_time = time.time()
+        if (now - self._last_read_time) < self.read_interval:
+            return
+        try:
+            # Reconnect for reads when the UR bridge dropped the session after a write.
+            if self.sock is None:
+                self.connect(settle_delay=0)
+            self._read_input_registers()
+        except ConnectionError:
+            # Do not kill the publisher thread; retry on the next poll / moveG.
+            self._invalidate_socket()
+        self._last_read_time = time.time()
 
     def update(self):
         """Call this every control loop iteration."""
-        if self.sock is None:
-            return
-
-        # Drain old write responses
+        # Poll reconnects when sock is None; drain only needs a live session.
         self._drain_write_responses()
-
-        # Send read request if it's time
         self._poll_input_registers_if_due()
 
-    def state(self, refresh=True) -> float:
+    def state(self, refresh=True) -> dict:
         """
         Get cached position (non-blocking).
         Returns normalized position: 1.0 = fully open, 0.0 = fully closed.
@@ -310,8 +309,13 @@ class RobotiqTcpDriver:
         if refresh:
             self._poll_input_registers_if_due()
         pos = self._byte_to_normalized(self.gPO)
-        state = {"gripper_position": pos}
-        return state
+        feedback_age = None
+        if self._last_successful_read_time is not None:
+            feedback_age = time.time() - self._last_successful_read_time
+        return {
+            "gripper_position": pos,
+            "feedback_age": feedback_age,
+        }
 
     def reset(self):
         """Reset the gripper by clearing all output registers."""
@@ -449,7 +453,10 @@ class RobotiqTcpDriver:
         # Set rGTO bit (bit 3) to initiate motion, keep rACT (bit 0) set
         self.output_regs[0] = 0x09  # rACT=1, rGTO=1 (binary: 00001001)
 
-        self._write_output_registers()
+        # Skip redundant FC16 when the control loop re-sends the same target (~100 Hz).
+        if self._last_written_position_byte != position_byte or wait:
+            self._write_output_registers()
+            self._last_written_position_byte = position_byte
 
         if wait:
             return self.wait_for_motion(timeout)
@@ -517,6 +524,9 @@ class RobotiqTcpDriver:
 
     def get_status(self):
         """Return dictionary with current gripper status."""
+        feedback_age = None
+        if self._last_successful_read_time is not None:
+            feedback_age = time.time() - self._last_successful_read_time
         return {
             "gACT": self.gACT,  # Activation status
             "gGTO": self.gGTO,  # Action status
@@ -526,4 +536,5 @@ class RobotiqTcpDriver:
             "position": self._byte_to_normalized(self.gPO),  # Actual position (0.0-1.0, 1.0=open)
             "current": self.gCU,  # Current draw
             "is_ready": self.is_ready,
+            "feedback_age": feedback_age,
         }
