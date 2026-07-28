@@ -1,6 +1,7 @@
 from .ag_gripper import AgGripperClient, AgGripperServer
 from .franka_arm import FrankaArmClient, FrankaArmServer
 from .franka_gripper import FrankaGripperClient, FrankaGripperServer
+from .inspire_hand import InspireHandClient, InspireHandServer
 from .kinova_arm import KinovaArmClient, KinovaArmServer
 from .piper_arm import PiperArmClient, PiperArmServer
 from .robotiq_gripper import RobotiqGripperClient, RobotiqGripperServer
@@ -17,6 +18,7 @@ __all__ = [
     "AgGripper",
     "FrankaArm",
     "FrankaGripper",
+    "InspireHand",
     "KinovaArm",
     "PiperArm",
     "RobotiqGripper",
