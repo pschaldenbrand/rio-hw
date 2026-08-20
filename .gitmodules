@@ -1,0 +1,3 @@
+[submodule "kord_bridge/kord-api"]
+	path = kord_bridge/kord-api
+	url = https://gitlab.com/kassowrobots/kord-api.git
