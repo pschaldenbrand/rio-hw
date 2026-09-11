@@ -43,8 +43,13 @@ public:
     // position reference because it is computed entirely inside the RT loop.
     struct VelCmd {
         std::array<double, kNumJoints> qd{};
-        std::array<double, kNumJoints> q_min{-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -2.967};
-        std::array<double, kNumJoints> q_max{ 2.967,  2.094,  2.967,  2.094,  2.967,  2.094,  2.967};
+        // Wide defaults: the previous ±2.09 rad limits on odd axes clipped real
+        // Kassow postures and yanked vel_q_ref_ on the first Vel tick → JREF span.
+        // Python sets tighter bounds only when KassowArm.joint_limits is set.
+        std::array<double, kNumJoints> q_min{-6.283185, -6.283185, -6.283185, -6.283185,
+                                             -6.283185, -6.283185, -6.283185};
+        std::array<double, kNumJoints> q_max{ 6.283185,  6.283185,  6.283185,  6.283185,
+                                              6.283185,  6.283185,  6.283185};
     };
 
     struct MoveJCmd {
@@ -75,29 +80,26 @@ public:
         kr2::kord::OverlayType  ot{kr2::kord::OT_STOPPOINT};
     };
 
-    // Streaming moveL: Cartesian via-point streaming.
+    // Streaming moveL: Cartesian via-point streaming with RT micro-steps.
     //
-    // Two tracking types are useful here, and they trade off differently:
+    // Python publishes a goal at ~100 Hz (KassowStation default). The RT loop
+    // keeps waitSync at 250 Hz and emits OT_VIAPOINT moveL on a decimated
+    // schedule. Defaults match KORD's real_time_patterns.rst: every 2nd tick
+    // (~125 Hz) with TT=0.016 / BT=0.008.
+    // Full-rate (throttle=1, TT=0.008) matches kord_move_linear.cpp but can drop
+    // the session when the link cannot sustain a command every tick.
+    // Idle (at goal) stops sending; the next goal re-anchors from measured TCP.
     //
-    //   TT_TIME            tt_val is a deadline in seconds, so the resulting TCP
-    //                      speed is (target step / tt_val).  Going faster by
-    //                      shrinking tt_val also inflates KORD's acceleration
-    //                      estimate, which trips INFEASIBLE_MOVE_COMMAND or a
-    //                      torque-deviation fault.  Keep tt_val near the command
-    //                      period and raise the step size instead.
-    //   TT_WS_TARGET_SPEED tt_val is the TCP speed in m/s and KORD derives the
-    //                      duration itself (see docs/features/motion_constraints).
-    //                      Speed is then independent of the send rate and of how
-    //                      far ahead the target sits, so it survives a jittery
-    //                      Python loop far better.
-    //
-    // Defaults keep the TT_TIME behaviour that is known good on this robot.
+    // max_pos_speed / max_rot_speed size each micro-step so a far goal is not
+    // compressed into one short TT window (that recreates torque spikes).
     struct StreamLCmd {
         std::array<double, 6>   tcp{};
         kr2::kord::TrackingType tt{kr2::kord::TT_TIME};
-        double                  tt_val{0.10};  // seconds for TT_TIME, m/s for TT_WS_TARGET_SPEED
+        double                  tt_val{0.016};
         kr2::kord::BlendType    bt{kr2::kord::BT_TIME};
-        double                  bt_val{0.07};  // seconds for BT_TIME, metres for BT_WS_RADIUS
+        double                  bt_val{0.008};
+        double                  max_pos_speed{0.15};
+        double                  max_rot_speed{0.25};
     };
 
     explicit KordBridge(const std::string& ip, unsigned int port = 7582,
@@ -118,6 +120,15 @@ public:
     void  set_stream_l_throttle(int n);  // send moveL every n waitSync ticks; 1 = full rate
     void  queue_move_j(const MoveJCmd& cmd);
     void  queue_move_l(const MoveLCmd& cmd);
+    // Clear recoverable controller latches. Call only when the RT thread is
+    // stopped — uses waitSync on this thread.
+    bool clear_alarm(kr2::kord::ControlInterface::EClearRequest request);
+    // CLEAR_HALT + CBUN_EVENT + UNSUSPEND (same set as kord-clean-alarm --all
+    // minus CONTINUE_INIT). Needed after SafetyEvent ESTOP; --cbun alone is not
+    // enough, and kord-clean-alarm keeps only the last dedicated flag unless
+    // --all is used.
+    bool clear_recoverable_alarms();
+    bool clear_cbun_event();  // CBUN_EVENT only
 
 private:
     enum class CmdType { None, DJC, Vel, StreamJ, StreamL, MoveJ, MoveL };
@@ -157,9 +168,14 @@ private:
     std::atomic<int> stream_j_throttle_{2};  // send moveJ every N ticks; 1 = full sync rate
     int              stream_j_counter_{0};   // RT-thread-local, no mutex needed
 
-    // StreamL throttle — keep send rate modest; flooding moveL drops sessions.
-    std::atomic<int> stream_l_throttle_{5};  // ~50 Hz at 250 Hz sync
-    int              stream_l_counter_{0};   // RT-thread-local, no mutex needed
+    // StreamL micro-step state — owned by the RT thread (goal latched under cmd_mtx_).
+    std::atomic<int> stream_l_throttle_{2};  // every 2nd tick ≈ 125 Hz (real_time_patterns)
+    int              stream_l_counter_{0};
+    int              stream_l_ticks_since_goal_{0};  // sync ticks since last Python goal
+    std::array<double, 6> stream_l_curr_{};
+    std::array<double, 6> stream_l_goal_{};
+    bool stream_l_have_curr_{false};
+    bool stream_l_active_{false};
 };
 
 } // namespace rio

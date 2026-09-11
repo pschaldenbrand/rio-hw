@@ -12,9 +12,11 @@ The integration has three layers:
 3. `kord_bridge`, which exposes `kord-api` to Python as `_kord_bridge` and runs
    the `waitSync()` control loop in a dedicated C++ thread at 250 Hz.
 
-`KassowArm` sits on top and streams `moveL` / `moveJ` waypoints as
-`OT_VIAPOINT` motions, so the arm blends through targets instead of stopping at
-each one.
+`KassowArm` accepts Cartesian goals from Python at the teleop rate (default
+100 Hz). The default controller is **`task_pos_ik`**: local Pinocchio IK on the
+packaged KR1018 URDF, then joint-velocity tracking via `directJControl`. Legacy
+`task_pos` still streams `OT_VIAPOINT` `moveL` (waitSync 250 Hz, send every 2nd
+tick ~125 Hz with `TT_TIME=0.016` / `BT_TIME=0.008`).
 
 ## 1. Install the KORD CBun on the robot
 
@@ -106,10 +108,20 @@ Do not assign the robot's own address to the workstation.
 
 ## 6. Teleoperate
 
-From the `rio` checkout:
+From the `rio` checkout (needs Pinocchio via `rio_hw[robots]` / `pin`):
 
 ```bash
 STATION=KassowStation uv run -m examples.teleop_eef
+```
+
+Default path: Spacemouse EEF deltas → Pinocchio IK (`rio_hw/assets/kassow/kr2_robot_S00V0000M1018.urdf`)
+→ `VelCmd` / `directJControl`. You should see `moveL 0.0 Hz` in diagnostics while
+the arm still tracks smoothly. Override speeds as needed:
+
+```bash
+STATION=KassowStation uv run -m examples.teleop_eef \
+    --arm-cfg.max-pos-speed 0.15 --arm-cfg.max-rot-speed 0.45 \
+    --arm-cfg.max-motor-speed 0.5 --arm-cfg.log-diagnostics --freq 100
 ```
 
 Override the robot address, or drive it from the keyboard instead:
@@ -117,6 +129,14 @@ Override the robot address, or drive it from the keyboard instead:
 ```bash
 STATION=KassowStation uv run -m examples.teleop_eef --arm-cfg.robot-ip 192.168.1.44
 STATION=KassowStation uv run -m examples.teleop_eef --teleop Keyboard
+# On Wayland this auto-switches to SshKeyboard (stdin). Same keys: WASD/QE, IJKL/UO.
+```
+
+Legacy streamed `moveL` (no local IK):
+
+```bash
+STATION=KassowStation uv run -m examples.teleop_eef \
+    --arm-cfg.robot-controller task_pos
 ```
 
 Recordings land in `data/pick_and_place/` as `.vla` trajectories. Set
@@ -130,14 +150,51 @@ STATION=KassowStation uv run -m examples.teleop_eef \
     --arm-cfg.robot-controller joint_pos --action-space joint_pos
 ```
 
+## Local IK (`task_pos_ik`)
+
+Cartesian teleop keeps the `task_pos` action interface (recorded actions stay
+EEF poses as RIO ``[xyz, rotvec]``). Inside `KassowArm`, each `moveL` target is
+turned into a Cartesian twist ``v = clip(ik_kp * (target - measured))`` and mapped
+to joint velocity with a damped Jacobian inverse (`directJControl` / VelCmd).
+The measured→commanded lead is used so FK/TCP frame mismatch is not chased.
+``qd`` is EMA-smoothed and slew-limited. Hands-off ramps ``qd`` to zero.
+
+Tunables: `--arm-cfg.ik-kp`, `--arm-cfg.max-pos-speed`, `--arm-cfg.max-motor-speed`,
+`--arm-cfg.lowpass-alpha`, `--arm-cfg.max-joint-accel`, `--arm-cfg.urdf-path`,
+`--arm-cfg.ee-frame`.
+
+Spacemouse axes for Kassow default to the lab cell map (device Z → robot +X,
+device X → −Y, device Y → +Z). Override with
+`--teleop-cfg.tx-zup-spnav` (length-9 row-major 3×3) if your cell differs.
+
+## directJControl (joint velocity)
+
+`joint_vel` does **not** use `moveL`. Python sends joint velocities; the C++ bridge
+integrates them and calls `directJControl` on every `waitSync` (~250 Hz). That
+path usually tolerates full-rate sends better than streamed `moveL`.
+
+Spacemouse / Keyboard / Gamepad axes map onto joints 0–5 (joint 7 stays 0):
+
+```bash
+STATION=KassowStation uv run -m examples.teleop_joint_vel \
+    --arm-cfg.max-motor-speed 0.3 \
+    --arm-cfg.log-diagnostics \
+    --teleop Spacemouse
+# or: --teleop Keyboard
+```
+
+Start slow (`max_motor_speed` 0.2–0.3). Hands-off sends zero `qd` so the arm holds.
+
 ## Tuning Cartesian speed
 
-`max_pos_speed` and `max_rot_speed` are the speed knobs. Raise them in steps,
-watching the peak the node reports at startup:
+Python teleop stays at `freq` (default 100 Hz with `KassowStation`). Speed is set
+by `max_pos_speed` and `max_rot_speed`, which also size the C++ micro-steps
+(`speed * throttle / 250` per send). Raise them in steps:
 
 ```
-KassowArm: streamL TT_TIME 0.100s, BT_TIME 0.070s, peak commanded 0.225 m/s and 0.375 rad/s
-KassowArm: speed ceiling 0.150 m/s and 0.250 rad/s (envelope 22.5 mm, step guard 22.5 mm)
+KassowArm: streamL micro-steps TT_TIME 0.016s, BT_TIME 0.008s, throttle=2 (~125 Hz while moving)
+KassowArm: micro-step ceiling 1.20 mm / 2.00 mrad per tick at 0.150 m/s and 0.250 rad/s
+KassowArm: Python goal envelope 2.3 mm / 3.8 mrad, step guard 2.3 mm (cmd_freq=100 Hz)
 ```
 
 | | `max_pos_speed` | `max_rot_speed` |
@@ -151,50 +208,41 @@ Translation has room: the stock `max_ws_speed` is 2.0 m/s. Rotation is the
 tighter constraint, since `max_ws_orientation_speed` is 1.0 rad/s and KORD's
 estimate is conservative, so back `max_rot_speed` off first if alarms appear.
 
-Do **not** shorten `stream_l_tt` to go faster. Under `TT_TIME` it is a deadline,
-so shortening it compresses the whole trajectory and inflates the acceleration
-KORD estimates, which trips `INFEASIBLE_MOVE_COMMAND` or a torque-deviation
-fault. Keep it near `1 / freq`.
+Do **not** shrink `stream_l_tt` below ~2× the send period, and do **not** send
+large Python steps with a short TT. Without C++ interpolation that compresses
+each jump into a few milliseconds and recreates torque spikes. Scale TT/BT with
+throttle the way KORD documents (throttle 1 → 0.008/0.004, throttle 2 → 0.016/0.008)
+and raise the speed ceilings instead.
 
-If motion feels laggy rather than slow, the command period is the cause, not the
-speed. Raise `freq` and drop `stream_l_tt` to match, which halves both the
-latency and the per-command step at the same speed:
+If motion still feels stepped on the legacy `task_pos` path, raise teleop `freq`
+further (e.g. 125–200) so goals update more often; the bridge still syncs at
+250 Hz. `KassowStation` keeps `arm_cfg.cmd_freq` in sync with `freq` automatically.
 
 ```bash
-STATION=KassowStation uv run -m examples.teleop_eef \
-    --freq 20 --arm-cfg.stream-l-tt 0.05 --arm-cfg.stream-l-bt 0.035
+STATION=KassowStation uv run -m examples.teleop_eef --freq 125
 ```
-
-`freq` also sizes the node's guards, so change it there rather than on the arm
-config; `KassowStation` keeps `arm_cfg.cmd_freq` in sync automatically.
 
 ### Tracking modes
 
-`stream_l_mode` picks the KORD tracking type, and the two fail in mirror-image
-ways:
+`stream_l_mode` picks the KORD tracking type on each micro-step:
 
-- **`time` (default, `TT_TIME`)** pins the movement duration, which puts a floor
-  under every speed and acceleration estimate the controller makes. Recommended.
-- **`speed` (`TT_WS_TARGET_SPEED`)** makes `stream_l_speed` the TCP speed in m/s
-  and lets KORD derive the duration, so speed no longer depends on `freq` or on
-  how far ahead the target sits. That is more robust to a jittery loop, but
-  deriving duration from `distance / speed` puts no *lower* bound on it: the
-  sub-millimetre steps a Spacemouse produces at low deflection imply a near-zero
-  duration and get rejected. The node holds targets back until they accumulate
-  past `stream_l_speed × stream_l_min_track_time`, at the cost of moving in
-  discrete hops during fine motion. Prefer `time` for precise work.
+- **`time` (default, `TT_TIME`)** — recommended. Each via-point has a fixed
+  ~4 ms deadline; C++ keeps the step size small.
+- **`speed` (`TT_WS_TARGET_SPEED`)** — `stream_l_speed` is the TCP speed in m/s
+  and KORD derives the duration. Prefer `time` for teleop with micro-steps.
 
 ### Guards
 
-`KassowArm` conditions every target before it reaches KORD. All three guards
-derive from the speed ceilings, so raising `max_pos_speed` widens them together
-and no fixed value can silently become the real speed limit.
+`KassowArm` conditions every **Python goal** before it reaches the bridge.
+Guards derive from the speed ceilings and the teleop period (`cmd_freq`), not
+from the micro-step TT:
 
 | Guard | Role |
 | --- | --- |
-| Envelope | How far the commanded pose may lead the measured pose. |
-| Step guard | Per-command jump limit, so via-points stay continuous. |
+| Envelope | How far the Python goal may lead the measured pose. |
+| Step guard | Per-goal jump limit between teleop cycles. |
 | Minimum step | Speed mode only. Shortest duration a move may imply. |
+| C++ micro-step | Per-tick advance capped at `max_*_speed / 250`. |
 
 Joint targets get the same treatment from `max_motor_speed`: the first `moveJ`
 after connecting is anchored on the measured position, so it can only advance
@@ -204,18 +252,6 @@ position limits and does not report them over KORD, and the roll axes travel
 well past the ±170° that would look like a safe guess, so clipping to a guessed
 range would reject a perfectly valid pose and command a lurch of a radian or
 more. Set `joint_limits` explicitly if you know the limits for your model.
-
-The envelope flips meaning between modes, which is worth understanding before
-overriding `max_eef_delta_pos` / `_rot`:
-
-- Under `TT_TIME` the robot closes the whole remaining gap within
-  `stream_l_tt`, so the envelope **is** the peak commanded speed
-  (`envelope / stream_l_tt`). A deep envelope does not buy smoothness, it
-  multiplies the speed. A 0.18 rad envelope at `stream_l_tt 0.10` commands
-  1.8 rad/s, already above the stock 1.0 rad/s limit.
-- Under `TT_WS_TARGET_SPEED` the gap does not set the speed at all, so the
-  target needs to lead by several cycles and too tight an envelope caps the
-  speed instead.
 
 ## Reading alarms
 
@@ -232,22 +268,34 @@ KassowArm: KORD alarm, motion blocked: 0x000bba42 SoftStopEvent/INFEASIBLE_MOVE_
 | Condition | Meaning |
 | --- | --- |
 | `INFEASIBLE_MOVE_COMMAND` | Commanded speed or acceleration exceeded `[MOTION_CONSTRAINTS]`. Lower the speed or lengthen the implied duration. |
+| `MOVE_IN_INVALID_MOTION_STATE` | CBun ≥3.0.4 rejected a move because the controller is not ready (INIT/halt/suspend/brakes). Clear the state, then the alarm. |
 | `JTORQUE_DEVIATION_EXCEEDED` | Expected and measured joint torques diverged, usually too aggressive an acceleration. |
 | `JREF_POSITION_DELTA_SPAN` | Consecutive commanded joint positions too far apart, i.e. the target jumped. |
+| `JREF_X_SENSOR_POSITION_SPAN` | Joint reference vs sensor span — often leftover ESTOP after a jerk, or incomplete recovery. Clear with `sudo kord-clean-alarm -c <ip> --all` (not bare `--halt --cbun`: only the last dedicated flag is applied). Pendant release may still be required. |
 | `MODEL_X_TRJ_REFW_SSPAN_EXC` | Commanded TCP ran too far ahead of the model; shrink the envelope. |
 | `EXTERNAL_ESTOP_ACTIVATED` / `EXTERNAL_PSTOP_ACTIVATED` | Physical stop, not a tuning problem. |
+
+On connect, `KassowArm` runs `CLEAR_HALT` + `CBUN_EVENT` + `UNSUSPEND` before the
+RT loop starts (same set as `kord-clean-alarm --all` minus `CONTINUE_INIT`).
+That recovers SafetyEvent ESTOP residue that a CBun-only clear leaves behind.
 
 Full tables are in `kord_bridge/kord-api/docs/guides/safety/handle_alarms.rst`.
 The absolute ceiling is the controller's own `[MOTION_CONSTRAINTS]` section in
 `KORD.ini`; commands above it never reach the controller.
 
 Set `arm_cfg.log_diagnostics` to report the achieved sync and command rates
-every two seconds, which is the quickest way to tell a throttled command stream
-from a controller that is rejecting moves:
+every two seconds. While moving you want `sync` near 250 Hz and `moveL` near
+the decimated rate (~125 Hz with default throttle=2); hands-off should drop to
+~0 Hz (idle stops sending):
 
 ```
-KassowArm: sync 250.1 Hz | moveJ 0.0 Hz | moveL 9.8 Hz
+KassowArm: sync 250.1 Hz | moveJ 0.0 Hz | moveL 124.8 Hz
 ```
+
+If sessions still drop, try `--arm-cfg.stream-l-throttle 4` with
+`--arm-cfg.stream-l-tt 0.032 --arm-cfg.stream-l-bt 0.016`. Full-rate
+`--arm-cfg.stream-l-throttle 1 --arm-cfg.stream-l-tt 0.008 --arm-cfg.stream-l-bt 0.004`
+matches the linear examples but needs a clean wired link and RT scheduling.
 
 Keep the emergency stop accessible and raise speeds incrementally.
 

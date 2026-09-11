@@ -37,6 +37,7 @@ class Spacemouse(Node):
         max_value=500,
         deadzone=(0, 0, 0, 0, 0, 0),
         n_buttons=2,
+        tx_zup_spnav=None,
         dtype=np.float32,
         *,
         freq: int = 200,
@@ -50,6 +51,10 @@ class Spacemouse(Node):
             max_value: {300, 500} 300 for wired version and 500 for wireless
             deadzone: [0,1], number or tuple, axis with value lower than this value will stay at 0
             n_buttons:
+            tx_zup_spnav: Optional 3×3 (or length-9) map from spacenav device axes
+                (X right, Y away, Z up) into the robot base frame. Default remaps
+                device Z→−X (legacy tabletop convention). For Z-up bases (Kassow),
+                pass a map that keeps device Z as robot Z.
             dtype:
 
         front
@@ -68,7 +73,11 @@ class Spacemouse(Node):
         self.max_value = max_value
         self.deadzone = deadzone
         self.n_buttons = n_buttons
-        self.tx_zup_spnav = np.array([[0, 0, -1], [1, 0, 0], [0, 1, 0]], dtype=dtype)
+        if tx_zup_spnav is None:
+            # Legacy: device Z-up → robot −X (see _get_motion_state_transformed).
+            self.tx_zup_spnav = np.array([[0, 0, -1], [1, 0, 0], [0, 1, 0]], dtype=dtype)
+        else:
+            self.tx_zup_spnav = np.asarray(tx_zup_spnav, dtype=dtype).reshape(3, 3)
         self.dtype = dtype
         super().__init__(freq=freq, max_buffer_size=max_buffer_size, **kwargs)
 

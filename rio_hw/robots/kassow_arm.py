@@ -4,12 +4,20 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from loguru import logger
+from scipy.spatial.transform import Rotation as R
 
 from .. import time
 from ..filters import LowPassFilter
 from ..middleware import ClientFactory, ServerFactory
 from ..node import Node
 from ..request import Request
+from .kassow_kinematics import (
+    DEFAULT_EE_FRAME,
+    DEFAULT_URDF_PATH,
+    KassowKinematics,
+    kord_tcp_to_pose6,
+    pose6_to_kord_tcp,
+)
 
 try:
     import _kord_bridge
@@ -66,6 +74,14 @@ _ALARM_CONDITION = {
         3001: "CBUN_KORD_BAD_CONN_QUALITY",
         3002: "INFEASIBLE_MOVE_COMMAND",
         3003: "CBUN_KORD_COMM_ERROR",
+        # CBun ≥3.0.4; may also report under CBunEvent (category 4).
+        3004: "MOVE_IN_INVALID_MOTION_STATE",
+    },
+    4: {
+        3001: "CBUN_KORD_BAD_CONN_QUALITY",
+        3002: "INFEASIBLE_MOVE_COMMAND",
+        3003: "CBUN_KORD_COMM_ERROR",
+        3004: "MOVE_IN_INVALID_MOTION_STATE",
     },
 }
 
@@ -93,31 +109,44 @@ def describe_alarm(code: int) -> str:
 
 class RobotController(Enum):
     TASK_POS = auto()
+    TASK_POS_IK = auto()  # Cartesian goals → Pinocchio IK → VelCmd / directJControl
     JOINT_POS = auto()
+    JOINT_VEL = auto()  # VelCmd → directJControl every waitSync
 
 
 class RequestType(Enum):
     MOVEL = auto()
     MOVEJ = auto()
+    SPEEDJ = auto()
+
+
+# Joint tracking deadband for task_pos_ik (rad); below this, send zero qd.
+_IK_HOLD_EPS = 1e-3
+# Cap ||q_ik - q|| before applying ik_kp so a bad IK step cannot command a lurch.
+_IK_MAX_Q_ERR = 0.06  # rad
+# Hands-off: only force zero VelCmd after teleop stops (not between 100 Hz packets).
+_IK_IDLE_HOLD_S = 0.05
+# Treat orientation as "hold measured" below this (rad) — avoids chasing rotvec noise.
+_IK_ORIENT_HOLD = 0.02
 
 
 class KassowArm(Node):
     """Kassow KR-series 7-DOF arm, driven over KORD by a C++ real-time bridge.
 
     The `_kord_bridge` extension runs kord-api's `waitSync()` loop in a dedicated
-    C++ thread at 250 Hz, independent of Python's GC. `moveL` and `moveJ` publish
-    a target that the bridge streams as an `OT_VIAPOINT` motion, so the robot
-    blends through waypoints instead of stopping at each one.
+    C++ thread at 250 Hz.
 
-    Targets are conditioned before they reach KORD: clamped to an envelope around
-    the measured pose, rate-limited against the previous waypoint, and withheld
-    while a system alarm blocks motion. Those guards are what stop KORD from
-    rejecting a command as INFEASIBLE_MOVE_COMMAND or faulting on torque
-    deviation, so they live here rather than in the caller.
+    Controllers:
+      - `task_pos` — Python Cartesian goals → streamed `moveL` micro-steps
+      - `task_pos_ik` — Cartesian goals → local Pinocchio IK → joint-vel
+        (`VelCmd` / `directJControl`); preferred for EEF teleop
+      - `joint_pos` — Python joint goals → streamed `moveJ`
+      - `joint_vel` — Python joint velocities → C++ integrates `qd` and calls
+        `directJControl` every tick (usually more tolerant of full-rate sends
+        than streamed `moveL`)
 
-    Raise `max_pos_speed` and `max_rot_speed` to teleoperate faster. Do not
-    shorten `stream_l_tt` instead: under TT_TIME that compresses the whole
-    trajectory and inflates the acceleration KORD estimates.
+    Raise `max_pos_speed` / `max_rot_speed` for Cartesian teleop, or
+    `max_motor_speed` for joint-velocity teleop.
     """
 
     __api__ = [
@@ -125,6 +154,7 @@ class KassowArm(Node):
         "get_all_state",
         "moveL",
         "moveJ",
+        "speedJ",
     ]
     __pub__ = True
     __req__ = True
@@ -135,16 +165,16 @@ class KassowArm(Node):
         port: int = 7582,
         session_id: int = 1,
         rt_priority: int = 80,
-        robot_controller: str = "task_pos",
+        robot_controller: str = "task_pos_ik",
         max_pos_speed: float = 0.15,
         max_rot_speed: float = 0.25,
         cmd_freq: int = 10,
         stream_l_mode: str = "time",
-        stream_l_tt: float = 0.10,
-        stream_l_bt: float = 0.07,
+        stream_l_tt: float = 0.016,
+        stream_l_bt: float = 0.008,
         stream_l_speed: float = 0.0,
         stream_l_min_track_time: float = 0.04,
-        stream_l_throttle: int = 5,
+        stream_l_throttle: int = 2,
         stream_j_speed: float = 0.3,
         stream_j_throttle: int = 2,
         max_motor_speed: float = 1.0,
@@ -154,7 +184,11 @@ class KassowArm(Node):
         max_eef_delta_rot: float = 0.0,
         max_cmd_step_pos: float = 0.0,
         max_cmd_step_rot: float = 0.0,
-        lowpass_alpha: float | None = 0.35,
+        lowpass_alpha: float | None = 0.2,
+        max_joint_accel: float | None = 1.5,
+        urdf_path: str | None = None,
+        ee_frame: str = DEFAULT_EE_FRAME,
+        ik_kp: float = 8.0,
         log_diagnostics: bool = False,
         dtype=np.float64,
         *,
@@ -168,22 +202,28 @@ class KassowArm(Node):
             port: KORD UDP port.
             session_id: KORD session id, must match the CBun configuration.
             rt_priority: SCHED_FIFO priority for the C++ loop; needs CAP_SYS_NICE.
-            robot_controller: "task_pos" (streamL) or "joint_pos" (streamJ).
+            robot_controller: "task_pos_ik" (local IK → VelCmd), "task_pos"
+                (streamL), "joint_pos" (streamJ), or "joint_vel" (VelCmd).
             max_pos_speed: Translation speed ceiling in m/s.
             max_rot_speed: Rotation speed ceiling in rad/s.
             cmd_freq: Rate the caller sends targets at, used to size the guards.
             stream_l_mode: "time" for TT_TIME, "speed" for TT_WS_TARGET_SPEED.
                 Speed tracking lets KORD derive the duration, so the resulting
                 motion no longer depends on how fast the caller's loop runs.
-            stream_l_tt: TT_TIME deadline in seconds; keep it near 1 / cmd_freq.
-            stream_l_bt: BT_TIME blend window in seconds.
+            stream_l_tt: TT_TIME deadline per C++ micro-step (seconds). Default
+                0.016 is 2× the send period at throttle=2 (KORD real_time_patterns).
+            stream_l_bt: BT_TIME blend window per micro-step, in seconds.
+                Default 0.008 (~50% of TT).
             stream_l_speed: TCP speed in m/s for "speed" mode. 0 derives
                 1.5 * max_pos_speed, giving the TCP headroom to converge on the
                 target rather than trail it.
             stream_l_min_track_time: Shortest move duration speed tracking may
                 imply, in seconds. Targets are held back until the accumulated
                 step is long enough that KORD will accept it.
-            stream_l_throttle: Send moveL every n sync ticks.
+            stream_l_throttle: Send moveL every n sync ticks while micro-stepping.
+                Keep waitSync at 250 Hz always; only decimate moveL. Default 2 ≈
+                125 Hz (documented when full-rate moveL causes waitSync timeouts).
+                Idle still sends nothing once the micro-step lands on the goal.
             stream_j_speed: Max joint speed in rad/s for streamJ waypoints.
             stream_j_throttle: Send moveJ every n sync ticks.
             max_motor_speed: Joint speed ceiling in rad/s, used to size the
@@ -202,11 +242,19 @@ class KassowArm(Node):
                 0 derives it from max_pos_speed.
             max_cmd_step_rot: Per-command rotation jump guard in rad.
                 0 derives it from max_rot_speed.
-            lowpass_alpha: EMA smoothing on streamL / streamJ targets after the
-                guards. None disables it. Updates at the teleop command rate, so
-                values near 0.3-0.5 smooth Spacemouse motion without the heavy
-                lag that 0.1 would add at 10 Hz. Hands-off snaps reset the
-                filter so it does not keep coasting.
+            lowpass_alpha: EMA smoothing on streamL / streamJ / IK Cartesian
+                targets and ``qd`` after the guards. None disables it. Smaller
+                is smoother/slower to respond (0.15–0.25 is a good teleop band
+                at 100 Hz). Hands-off resets the filter so it does not coast.
+            max_joint_accel: Per-joint slew limit on ``qd`` in rad/s² for VelCmd
+                paths (`task_pos_ik`, `joint_vel`). Caps how fast velocity may
+                change so Spacemouse spikes and idle→hold do not jerk the
+                reference. None disables it.
+            urdf_path: URDF for `task_pos_ik`. Defaults to the packaged KR1018
+                kinematics model.
+            ee_frame: Tip frame name in the URDF (default ``end_effector``).
+            ik_kp: Task-space P gain (1/s) mapping Cartesian lead to twist
+                before the Jacobian map. ~5–10 is responsive at 100 Hz teleop.
             log_diagnostics: Report sync and command rates every two seconds.
             dtype: Published state dtype. KORD is double precision.
         """
@@ -215,8 +263,11 @@ class KassowArm(Node):
         assert 0 < max_pos_speed
         assert 0 < max_rot_speed
         assert 0 < max_motor_speed
+        assert 0 < ik_kp
         if lowpass_alpha is not None and not (0.0 < lowpass_alpha < 1.0):
             raise ValueError(f"lowpass_alpha must be in (0, 1) or None, got {lowpass_alpha}")
+        if max_joint_accel is not None and max_joint_accel <= 0.0:
+            raise ValueError(f"max_joint_accel must be > 0 or None, got {max_joint_accel}")
         if stream_l_mode not in ("time", "speed"):
             raise ValueError(f"stream_l_mode must be 'time' or 'speed', got {stream_l_mode!r}")
         if max_buffer_size is None:
@@ -227,9 +278,20 @@ class KassowArm(Node):
         self.session_id = session_id
         self.rt_priority = rt_priority
         self.robot_controller = RobotController[robot_controller.upper()]
+        if self.robot_controller not in (
+            RobotController.TASK_POS,
+            RobotController.TASK_POS_IK,
+            RobotController.JOINT_POS,
+            RobotController.JOINT_VEL,
+        ):
+            raise ValueError(
+                "robot_controller must be task_pos_ik, task_pos, joint_pos, or "
+                f"joint_vel; got {robot_controller!r}"
+            )
         self.num_joints = NUM_JOINTS
         self.max_pos_speed = max_pos_speed
         self.max_rot_speed = max_rot_speed
+        self.max_motor_speed = max_motor_speed
         self.cmd_freq = cmd_freq
         self.stream_l_mode = stream_l_mode
         self.stream_l_tt = stream_l_tt
@@ -238,6 +300,11 @@ class KassowArm(Node):
         self.stream_j_speed = stream_j_speed
         self.stream_j_throttle = stream_j_throttle
         self.lowpass_alpha = lowpass_alpha
+        self.max_joint_accel = max_joint_accel
+        self.urdf_path = urdf_path or DEFAULT_URDF_PATH
+        self.ee_frame = ee_frame
+        self.ik_kp = ik_kp
+        self._kin: KassowKinematics | None = None
         if joint_limits is None:
             self.joint_limits = None
         else:
@@ -254,13 +321,15 @@ class KassowArm(Node):
         step_pos = max_cmd_step_pos or 1.5 * max_pos_speed * dt
         step_rot = max_cmd_step_rot or 1.5 * max_rot_speed * dt
         self._max_joint_step = 1.5 * max_motor_speed * dt
-        # How far ahead of the measured pose the target is allowed to sit. Under
-        # TT_TIME the robot closes the whole remaining gap within stream_l_tt, so
-        # the envelope *is* the peak commanded speed and has to stay near
-        # max_pos_speed * stream_l_tt. Under speed tracking the gap does not set
-        # the speed, and the target needs to lead by several cycles to keep the
-        # arm moving.
-        lead = 6.0 * dt if stream_l_mode == "speed" else 1.5 * stream_l_tt
+        # How far ahead of the measured pose the Python goal may sit. Local IK
+        # tracks with joint-vel, so allow a longer Cartesian lead than streamL
+        # (which needed a tight envelope for via-point feasibility).
+        if self.robot_controller == RobotController.TASK_POS_IK:
+            lead = 4.0 * dt
+        elif stream_l_mode == "speed":
+            lead = 6.0 * dt
+        else:
+            lead = 1.5 * dt
         env_pos = max_eef_delta_pos or max_pos_speed * lead
         env_rot = max_eef_delta_rot or max_rot_speed * lead
 
@@ -291,10 +360,13 @@ class KassowArm(Node):
         example_request_params = {
             "target_eef_pose": np.zeros((6,), dtype=self.dtype),
             "target_joint_q": np.zeros((NUM_JOINTS,), dtype=self.dtype),
+            "target_joint_qd": np.zeros((NUM_JOINTS,), dtype=self.dtype),
         }
         request_params_keys = {
             RobotController.TASK_POS: (RequestType.MOVEL, ("target_eef_pose",)),
+            RobotController.TASK_POS_IK: (RequestType.MOVEL, ("target_eef_pose",)),
             RobotController.JOINT_POS: (RequestType.MOVEJ, ("target_joint_q",)),
+            RobotController.JOINT_VEL: (RequestType.SPEEDJ, ("target_joint_qd",)),
         }[self.robot_controller][1]
         example_request_params = {k: example_request_params[k] for k in request_params_keys}
         example_request_params["target_time"] = time.now()
@@ -304,6 +376,28 @@ class KassowArm(Node):
             raise RuntimeError(f"KassowArm: failed to connect to {self.robot_ip}:{self.port}")
         self._bridge.set_stream_l_throttle(self.stream_l_throttle)
         self._bridge.set_stream_j_throttle(self.stream_j_throttle)
+        # After SafetyEvent ESTOP (e.g. JREF_X_SENSOR_POSITION_SPAN) a CBun-only
+        # clear is not enough — CLEAR_HALT must run too. kord-clean-alarm keeps
+        # only the last dedicated flag unless --all is passed.
+        if self._bridge.clear_recoverable_alarms():
+            logger.info("KassowArm: cleared recoverable halt/CBun/unsuspend latches")
+
+        if self.robot_controller == RobotController.TASK_POS_IK:
+            self._kin = KassowKinematics(urdf_path=self.urdf_path, ee_frame=self.ee_frame)
+            # FK check waits for the first synced state in req() — get_state() is
+            # still zeroed until the RT loop has called fetchData().
+            self._fk_checked = False
+        else:
+            self._fk_checked = True
+        # Don't send hold VelCmd zeros until a real teleop command has entered
+        # Vel mode — premature directJControl triggers MOVE_IN_INVALID_MOTION_STATE.
+        self._vel_mode_active = False
+        self._qd_filter = None
+        self._last_qd = None
+        self._last_qd_t = None
+        self._diag_vel_n = 0
+        self._diag_qd_sum = 0.0
+        self._diag_dp_sum = 0.0
 
         self.example_request = {
             "type": next(iter(RequestType)).value,
@@ -337,7 +431,7 @@ class KassowArm(Node):
 
                 # Store current state in ring buffer
                 data = {
-                    "eef_pose": np.array(state.tcp_pose, dtype=self.dtype),
+                    "eef_pose": kord_tcp_to_pose6(state.tcp_pose).astype(self.dtype),
                     "joint_q": np.array(state.joint_q, dtype=self.dtype),
                     "joint_qd": np.array(state.joint_qd, dtype=self.dtype),
                     "joint_tau": np.array(state.joint_tau, dtype=self.dtype),
@@ -354,18 +448,32 @@ class KassowArm(Node):
                 if bool(state.alarm_code) != alarmed:
                     alarmed = not alarmed
                     if alarmed:
-                        logger.warning(f"KassowArm: KORD alarm, motion blocked: {describe_alarm(state.alarm_code)}")
+                        logger.warning(
+                            f"KassowArm: KORD alarm, motion blocked: {describe_alarm(state.alarm_code)} "
+                            "(often invisible on the teach pendant; CBun software latch)"
+                        )
                     else:
                         logger.info("KassowArm: KORD alarm cleared")
 
                 if self.log_diagnostics:
                     elapsed = data["timestamp"] - t_diag
                     if elapsed >= DIAGNOSTICS_INTERVAL:
-                        logger.info(
+                        msg = (
                             f"KassowArm: sync {(state.tick - tick_0) / elapsed:.1f} Hz | "
                             f"moveJ {(state.stream_j_sends - sends_j_0) / elapsed:.1f} Hz | "
                             f"moveL {(state.stream_l_sends - sends_l_0) / elapsed:.1f} Hz"
                         )
+                        n = self._diag_vel_n
+                        if n > 0:
+                            msg += (
+                                f" | vel {n / elapsed:.0f} Hz "
+                                f"||qd||={self._diag_qd_sum / n:.3f} "
+                                f"lead={self._diag_dp_sum / n * 1e3:.1f} mm"
+                            )
+                            self._diag_vel_n = 0
+                            self._diag_qd_sum = 0.0
+                            self._diag_dp_sum = 0.0
+                        logger.info(msg)
                         t_diag, tick_0 = data["timestamp"], state.tick
                         sends_j_0, sends_l_0 = state.stream_j_sends, state.stream_l_sends
                 rate.precise_sleep()
@@ -381,6 +489,18 @@ class KassowArm(Node):
         self._log_motion_envelope()
         if self.lowpass_alpha is not None:
             logger.info(f"KassowArm: command low-pass alpha={self.lowpass_alpha:.2f}")
+        if self.robot_controller == RobotController.TASK_POS_IK:
+            accel = (
+                f", max_joint_accel={self.max_joint_accel:.1f} rad/s²"
+                if self.max_joint_accel is not None
+                else ""
+            )
+            logger.info(
+                f"KassowArm: task_pos_ik → Jacobian VelCmd (ik_kp={self.ik_kp:.1f} 1/s, "
+                f"max_motor_speed={self.max_motor_speed:.2f} rad/s{accel})"
+            )
+        elif self.max_joint_accel is not None and self.robot_controller == RobotController.JOINT_VEL:
+            logger.info(f"KassowArm: qd slew limit {self.max_joint_accel:.1f} rad/s²")
 
         # Anchors for the rate limiters, adopted from the measured state on the
         # first command so a stale target can never be streamed at startup.
@@ -389,11 +509,25 @@ class KassowArm(Node):
         pose_filter = None
         joint_filter = None
         idle_cycles = 0
+        zeros7 = np.zeros((NUM_JOINTS,), dtype=self.dtype)
 
         try:
             rate = time.Rate(self.freq)
             self.req_ready_event.set()
             while not self.exit_event.is_set():
+                if not self._fk_checked and self._kin is not None:
+                    state = self._bridge.get_state()
+                    # tick advances only after the RT loop has fetched real status.
+                    if state.tick > 0:
+                        self._kin.check_fk_alignment(
+                            np.array(state.joint_q, dtype=np.float64),
+                            np.array(state.tcp_pose, dtype=np.float64),
+                        )
+                        self._fk_checked = True
+                    else:
+                        rate.precise_sleep()
+                        continue
+
                 # Fetch requests from queue
                 try:
                     reqs = self.request_queue.get_all()
@@ -403,23 +537,102 @@ class KassowArm(Node):
                     reqs = []
                 if not reqs:
                     idle_cycles += 1
+                    # Only hold with zero qd after Vel mode was entered by a real
+                    # command. Sending directJControl at startup re-latches
+                    # MOVE_IN_INVALID_MOTION_STATE on CBun ≥3.0.4.
+                    if (
+                        self.robot_controller == RobotController.TASK_POS_IK
+                        and self._vel_mode_active
+                        and idle_cycles >= max(2, int(self.freq * _IK_IDLE_HOLD_S))
+                    ):
+                        state = self._bridge.get_state()
+                        if not state.alarm_code:
+                            self._send_vel_cmd(zeros7)
                 elif idle_cycles > 0:
                     # Teleop stopped sending (hands off). Re-anchor so the next
                     # move starts from the measured pose with a fresh filter.
                     state = self._bridge.get_state()
-                    last_pose = np.array(state.tcp_pose, dtype=self.dtype)
+                    last_pose = kord_tcp_to_pose6(state.tcp_pose).astype(self.dtype)
                     last_joint_q = np.array(state.joint_q, dtype=self.dtype)
                     if pose_filter is not None:
                         pose_filter.s = last_pose.copy()
                     if joint_filter is not None:
                         joint_filter.s = last_joint_q.copy()
+                    self._qd_filter = None
                     idle_cycles = 0
                 for r in reqs:
                     req = Request(RequestType(r.pop("type")), r)
                     state = self._bridge.get_state()
 
-                    if req.type == RequestType.MOVEL:
-                        pose_now = np.array(state.tcp_pose, dtype=self.dtype)
+                    if req.type == RequestType.MOVEL and self.robot_controller == RobotController.TASK_POS_IK:
+                        pose_meas = kord_tcp_to_pose6(state.tcp_pose).astype(self.dtype)
+                        joint_q_now = np.array(state.joint_q, dtype=self.dtype)
+                        if last_pose is None or state.alarm_code:
+                            last_pose = pose_meas
+                            self._qd_filter = None
+                            self._last_qd = None
+                            self._last_qd_t = None
+                        if state.alarm_code:
+                            continue
+                        target = np.array(req.params["target_eef_pose"], dtype=self.dtype)
+                        # Relative Cartesian lead (measured TCP frame). Do NOT
+                        # low-pass the pose here — alpha=0.15 left ||qd|| near
+                        # zero. Smooth only the resulting joint velocity.
+                        dp = target[:3] - pose_meas[:3]
+                        dist = float(np.linalg.norm(dp))
+                        # Cap lead so a stuck teleop integrator cannot demand a
+                        # huge corrective velocity in one tick.
+                        lead_pos = max(float(self._max_step[0]) * 4.0, 0.01)
+                        if dist > lead_pos:
+                            dp = dp * (lead_pos / dist)
+                            dist = lead_pos
+
+                        r_meas = R.from_rotvec(pose_meas[3:])
+                        r_tgt = R.from_rotvec(target[3:])
+                        dR = r_meas.inv() * r_tgt
+                        ang = float(dR.magnitude())
+                        if ang < _IK_ORIENT_HOLD:
+                            omega = np.zeros(3, dtype=self.dtype)
+                        else:
+                            lead_rot = max(float(self._max_step[3]) * 4.0, 0.05)
+                            if ang > lead_rot:
+                                dR = R.from_rotvec(dR.as_rotvec() * (lead_rot / ang))
+                                ang = lead_rot
+                            omega = dR.as_rotvec() * self.ik_kp
+
+                        if dist < IDLE_EPS and ang < _IK_ORIENT_HOLD:
+                            qd = zeros7
+                        else:
+                            # Task-space P → twist, then Jacobian DLS → qd.
+                            # Tracks Spacemouse lead at up to max_*_speed instead
+                            # of the near-zero rates from position-IK * small kp.
+                            twist = np.zeros(6, dtype=np.float64)
+                            twist[:3] = self.ik_kp * dp
+                            sp = float(np.linalg.norm(twist[:3]))
+                            if sp > self.max_pos_speed > 0.0:
+                                twist[:3] *= self.max_pos_speed / sp
+                            twist[3:] = omega
+                            sr = float(np.linalg.norm(twist[3:]))
+                            if sr > self.max_rot_speed > 0.0:
+                                twist[3:] *= self.max_rot_speed / sr
+                            qd = self._kin.twist_to_qd(joint_q_now, twist)
+                            qd = np.clip(qd, -self.max_motor_speed, self.max_motor_speed).astype(
+                                self.dtype
+                            )
+                        if self.lowpass_alpha is not None:
+                            if self._qd_filter is None:
+                                self._qd_filter = LowPassFilter(alpha=self.lowpass_alpha, initial=zeros7)
+                            qd = np.asarray(self._qd_filter(qd), dtype=self.dtype)
+                        self._send_vel_cmd(qd)
+                        self._vel_mode_active = True
+                        last_pose = target
+                        if self.log_diagnostics:
+                            self._diag_vel_n += 1
+                            self._diag_qd_sum += float(np.linalg.norm(qd))
+                            self._diag_dp_sum += dist
+
+                    elif req.type == RequestType.MOVEL:
+                        pose_now = kord_tcp_to_pose6(state.tcp_pose).astype(self.dtype)
                         if last_pose is None or state.alarm_code:
                             # First command, or motion is blocked: re-anchor on
                             # the measured pose. Otherwise the caller's target
@@ -441,11 +654,13 @@ class KassowArm(Node):
                         if not self._is_new_waypoint(target, last_pose):
                             continue
                         cmd = _kord_bridge.StreamLCmd()
-                        cmd.tcp = target.tolist()
+                        cmd.tcp = pose6_to_kord_tcp(target).tolist()
                         cmd.tt = tracking_type
                         cmd.tt_val = self._tracking_val
                         cmd.bt = blend_type
                         cmd.bt_val = self.stream_l_bt
+                        cmd.max_pos_speed = self.max_pos_speed
+                        cmd.max_rot_speed = self.max_rot_speed
                         self._bridge.set_stream_l_command(cmd)
                         last_pose = target
 
@@ -476,11 +691,52 @@ class KassowArm(Node):
                         self._bridge.set_stream_j_command(cmd)
                         last_joint_q = target
 
+                    elif req.type == RequestType.SPEEDJ:
+                        # VelCmd: C++ integrates qd and calls directJControl every
+                        # waitSync. Keep sending (including zeros) so the RT loop
+                        # stays in Vel mode and holds when hands-off.
+                        if state.alarm_code:
+                            self._last_qd = None
+                            self._last_qd_t = None
+                            continue
+                        qd = np.array(req.params["target_joint_qd"], dtype=self.dtype)
+                        qd = np.clip(qd, -self.max_motor_speed, self.max_motor_speed)
+                        self._send_vel_cmd(qd)
+                        self._vel_mode_active = True
+
                     else:
                         raise ValueError(req.type)
                 rate.precise_sleep()
         except KeyboardInterrupt:
             pass
+
+    def _send_vel_cmd(self, qd: np.ndarray) -> None:
+        """Publish a VelCmd (directJControl path) with optional joint limits.
+
+        Applies ``max_joint_accel`` slew limiting so commanded ``qd`` cannot jump
+        between consecutive sends (including idle ramp-to-zero).
+        """
+        qd = np.asarray(qd, dtype=self.dtype).reshape(NUM_JOINTS).copy()
+        now = time.now()
+        # Always slew from the previous command (treat missing history as zero) so
+        # the first Spacemouse touch cannot step qd to the full IK output.
+        if self.max_joint_accel is not None:
+            prev = self._last_qd if self._last_qd is not None else np.zeros((NUM_JOINTS,), dtype=self.dtype)
+            if self._last_qd_t is None:
+                dt = 1.0 / max(self.cmd_freq, 1)
+            else:
+                dt = float(now - self._last_qd_t)
+            dt = max(1e-4, min(0.05, dt))
+            max_dq = self.max_joint_accel * dt
+            qd = prev + np.clip(qd - prev, -max_dq, max_dq)
+        self._last_qd = qd.copy()
+        self._last_qd_t = now
+        cmd = _kord_bridge.VelCmd()
+        cmd.qd = qd.tolist()
+        if self.joint_limits is not None:
+            cmd.q_min = self.joint_limits[0].tolist()
+            cmd.q_max = self.joint_limits[1].tolist()
+        self._bridge.set_vel_command(cmd)
 
     def _is_new_waypoint(self, target, last_pose) -> bool:
         """Decide whether a clamped target is worth streaming to the robot."""
@@ -495,22 +751,28 @@ class KassowArm(Node):
 
     def _log_motion_envelope(self):
         """Report the speeds the guards actually permit, once per node start."""
-        env_pos, env_rot = float(self._env_delta[0]), float(self._env_delta[3])
-        if self.stream_l_mode == "time":
-            dt = 1.0 / self.cmd_freq
-            if not 0.5 * dt <= self.stream_l_tt <= 2.0 * dt:
-                logger.warning(
-                    f"KassowArm: stream_l_tt={self.stream_l_tt:.3f}s is far from the {dt:.3f}s "
-                    f"command period, so TT_TIME motion will stutter. Set it near 1 / cmd_freq "
-                    f"or use stream_l_mode='speed'."
-                )
-            # Under TT_TIME the envelope sets the worst case the controller is
-            # ever asked for, and that is the number that trips
-            # MOTION_CONSTRAINTS, not max_pos_speed.
+        if self.robot_controller == RobotController.TASK_POS_IK:
             logger.info(
-                f"KassowArm: streamL TT_TIME {self.stream_l_tt:.3f}s, BT_TIME {self.stream_l_bt:.3f}s, "
-                f"peak commanded {env_pos / self.stream_l_tt:.3f} m/s and "
-                f"{env_rot / self.stream_l_tt:.3f} rad/s"
+                f"KassowArm: local IK envelope "
+                f"{float(self._env_delta[0]) * 1e3:.1f} mm / "
+                f"{float(self._env_delta[3]) * 1e3:.1f} mrad, "
+                f"step guard {float(self._max_step[0]) * 1e3:.1f} mm "
+                f"(cmd_freq={self.cmd_freq} Hz)"
+            )
+            return
+        env_pos, env_rot = float(self._env_delta[0]), float(self._env_delta[3])
+        micro_pos = self.max_pos_speed * (self.stream_l_throttle / 250.0)
+        micro_rot = self.max_rot_speed * (self.stream_l_throttle / 250.0)
+        if self.stream_l_mode == "time":
+            logger.info(
+                f"KassowArm: streamL micro-steps TT_TIME {self.stream_l_tt:.3f}s, "
+                f"BT_TIME {self.stream_l_bt:.3f}s, throttle={self.stream_l_throttle} "
+                f"(~{250 / max(1, self.stream_l_throttle):.0f} Hz while moving)"
+            )
+            logger.info(
+                f"KassowArm: micro-step ceiling {micro_pos * 1e3:.2f} mm / "
+                f"{micro_rot * 1e3:.2f} mrad per send at "
+                f"{self.max_pos_speed:.3f} m/s and {self.max_rot_speed:.3f} rad/s"
             )
         else:
             logger.info(
@@ -518,8 +780,9 @@ class KassowArm(Node):
                 f"BT_TIME {self.stream_l_bt:.3f}s, holding steps below {self._min_step_pos * 1e3:.1f} mm"
             )
         logger.info(
-            f"KassowArm: speed ceiling {self.max_pos_speed:.3f} m/s and {self.max_rot_speed:.3f} rad/s "
-            f"(envelope {env_pos * 1e3:.1f} mm, step guard {float(self._max_step[0]) * 1e3:.1f} mm)"
+            f"KassowArm: Python goal envelope {env_pos * 1e3:.1f} mm / "
+            f"{env_rot * 1e3:.1f} mrad, step guard {float(self._max_step[0]) * 1e3:.1f} mm "
+            f"(cmd_freq={self.cmd_freq} Hz)"
         )
 
     def get_state(self, k=None, out=None):
@@ -532,10 +795,10 @@ class KassowArm(Node):
         return self.ring_buffer.get_all()
 
     def moveL(self, target_eef_pose, target_time):
-        """Stream a Cartesian waypoint (position and axis-angle rotation).
+        """Cartesian waypoint as RIO pose6 ``[xyz, rotvec]``.
 
-        KORD derives the motion timing from the configured tracking type, so
-        `target_time` is accepted for interface compatibility but unused.
+        Converted to KORD XYZ-Euler at the bridge for ``task_pos`` streamL, or
+        solved with local IK for ``task_pos_ik``. `target_time` is unused.
         """
         target_eef_pose = np.array(target_eef_pose, dtype=self.dtype)
         assert target_eef_pose.shape == (6,)
@@ -557,6 +820,22 @@ class KassowArm(Node):
         req = {
             "type": RequestType.MOVEJ.value,
             "target_joint_q": target_joint_q,
+            "target_time": target_time,
+        }
+        self.request_queue.put(req)
+
+    def speedJ(self, target_joint_qd, target_time):
+        """Joint-velocity teleop via C++ VelCmd → directJControl every tick.
+
+        The bridge integrates `qd` into a position reference inside the RT loop,
+        so Python scheduling jitter does not create torque spikes the way a
+        naive directJ position stream would. `target_time` is unused.
+        """
+        target_joint_qd = np.array(target_joint_qd, dtype=self.dtype)
+        assert target_joint_qd.shape == (self.num_joints,)
+        req = {
+            "type": RequestType.SPEEDJ.value,
+            "target_joint_qd": target_joint_qd,
             "target_time": target_time,
         }
         self.request_queue.put(req)

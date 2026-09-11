@@ -107,6 +107,7 @@ robots = [
     "ur-rtde; sys_platform != 'darwin'",  # ur
     "xarm-python-sdk",  # xarm
     "i2rt @ https://github.com/i2rt-robotics/i2rt.git",  # yam
+    "pin",  # kassow local IK (task_pos_ik)
 ]
 # --- all dependencies ---
 all = [
@@ -129,6 +130,7 @@ include = ["rio_hw*"]
 rio_hw = [
     "_scripts/setup/*.sh",
     "_scripts/setup_gello/configs/templates/*.yaml",
+    "assets/kassow/*.urdf",
 ]
 
 [tool.setuptools.dynamic]

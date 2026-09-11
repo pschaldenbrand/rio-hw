@@ -52,11 +52,13 @@ NB_MODULE(_kord_bridge, m)
 
     nb::class_<KordBridge::StreamLCmd>(m, "StreamLCmd")
         .def(nb::init<>())
-        .def_rw("tcp",    &KordBridge::StreamLCmd::tcp)
-        .def_rw("tt",     &KordBridge::StreamLCmd::tt)
-        .def_rw("tt_val", &KordBridge::StreamLCmd::tt_val)
-        .def_rw("bt",     &KordBridge::StreamLCmd::bt)
-        .def_rw("bt_val", &KordBridge::StreamLCmd::bt_val);
+        .def_rw("tcp",            &KordBridge::StreamLCmd::tcp)
+        .def_rw("tt",             &KordBridge::StreamLCmd::tt)
+        .def_rw("tt_val",         &KordBridge::StreamLCmd::tt_val)
+        .def_rw("bt",             &KordBridge::StreamLCmd::bt)
+        .def_rw("bt_val",         &KordBridge::StreamLCmd::bt_val)
+        .def_rw("max_pos_speed",  &KordBridge::StreamLCmd::max_pos_speed)
+        .def_rw("max_rot_speed",  &KordBridge::StreamLCmd::max_rot_speed);
 
     nb::class_<KordBridge::MoveJCmd>(m, "MoveJCmd")
         .def(nb::init<>())
@@ -90,7 +92,11 @@ NB_MODULE(_kord_bridge, m)
         .def("set_stream_l_command", &KordBridge::set_stream_l_command)
         .def("set_stream_l_throttle", &KordBridge::set_stream_l_throttle,
              nb::arg("n"),
-             "Send moveL every n waitSync ticks. n=1 → full sync rate.")
+             "Send moveL every n waitSync ticks while micro-stepping. n=1 → full sync rate.")
         .def("queue_move_j",         &KordBridge::queue_move_j)
-        .def("queue_move_l",         &KordBridge::queue_move_l);
+        .def("queue_move_l",         &KordBridge::queue_move_l)
+        .def("clear_recoverable_alarms", &KordBridge::clear_recoverable_alarms,
+             "CLEAR_HALT + CBUN_EVENT + UNSUSPEND (RT thread must be stopped).")
+        .def("clear_cbun_event",     &KordBridge::clear_cbun_event,
+             "Clear a recoverable CBun latch only (RT thread must be stopped).");
 }
