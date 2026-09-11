@@ -126,8 +126,9 @@ _IK_HOLD_EPS = 1e-3
 _IK_MAX_Q_ERR = 0.06  # rad
 # Hands-off: only force zero VelCmd after teleop stops (not between 100 Hz packets).
 _IK_IDLE_HOLD_S = 0.05
-# Treat orientation as "hold measured" below this (rad) — avoids chasing rotvec noise.
-_IK_ORIENT_HOLD = 0.02
+# Below this angular error (rad), treat orientation as reached. Keep small so
+# translation-only teleop corrects Jacobian coupling before it accumulates.
+_IK_ORIENT_HOLD = 0.005
 
 
 class KassowArm(Node):
@@ -589,7 +590,10 @@ class KassowArm(Node):
 
                         r_meas = R.from_rotvec(pose_meas[3:])
                         r_tgt = R.from_rotvec(target[3:])
-                        dR = r_meas.inv() * r_tgt
+                        # World-frame error: LOCAL_WORLD_ALIGNED Jacobian expects ω_world.
+                        # (Body-frame r_meas.inv()*r_tgt was wrong and let translation
+                        # couple into orientation without a usable correction.)
+                        dR = r_tgt * r_meas.inv()
                         ang = float(dR.magnitude())
                         if ang < _IK_ORIENT_HOLD:
                             omega = np.zeros(3, dtype=self.dtype)
@@ -603,7 +607,7 @@ class KassowArm(Node):
                         if dist < IDLE_EPS and ang < _IK_ORIENT_HOLD:
                             qd = zeros7
                         else:
-                            # Task-space P → twist, then Jacobian DLS → qd.
+                            # Task-space P → twist, then weighted Jacobian DLS → qd.
                             # Tracks Spacemouse lead at up to max_*_speed instead
                             # of the near-zero rates from position-IK * small kp.
                             twist = np.zeros(6, dtype=np.float64)

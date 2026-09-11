@@ -107,11 +107,14 @@ class KassowKinematics:
         twist: np.ndarray,
         *,
         damping: float = 1e-2,
+        rot_weight: float = 10.0,
     ) -> np.ndarray:
         """Map a world-aligned spatial twist ``[v, ω]`` to joint velocities.
 
-        Uses a damped least-squares inverse of the LOCAL_WORLD_ALIGNED frame
-        Jacobian so linear/angular parts match base-frame teleop deltas.
+        Weighted damped least-squares on the LOCAL_WORLD_ALIGNED frame Jacobian
+        so linear/angular parts match base-frame teleop deltas. ``rot_weight``
+        scales the angular residual so translation-only twists do not freely
+        couple into orientation on a redundant arm.
         """
         q = np.asarray(q, dtype=np.float64).reshape(NUM_JOINTS)
         twist = np.asarray(twist, dtype=np.float64).reshape(6)
@@ -120,8 +123,12 @@ class KassowKinematics:
         J = pin.computeFrameJacobian(
             self.model, self.data, q, self.ee_id, pin.LOCAL_WORLD_ALIGNED
         )
-        JJt = J @ J.T
-        return J.T @ np.linalg.solve(JJt + (damping * damping) * np.eye(6), twist)
+        # min ||W (J qd - twist)||² + λ² ||qd||² with W = diag(1,1,1,rw,rw,rw)
+        w = np.array([1.0, 1.0, 1.0, rot_weight, rot_weight, rot_weight], dtype=np.float64)
+        Wh = np.diag(w)
+        a = J.T @ Wh @ J + (damping * damping) * np.eye(NUM_JOINTS)
+        b = J.T @ Wh @ twist
+        return np.linalg.solve(a, b)
 
     def ik(
         self,
