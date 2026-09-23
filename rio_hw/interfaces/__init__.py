@@ -7,6 +7,7 @@ from .manus_glove import ManusGloveClient, ManusGloveServer
 from .oculus_reader import OculusReaderClient, OculusReaderServer
 from .spacemouse import SpacemouseClient, SpacemouseServer
 from .ssh_keyboard import SshKeyboardClient, SshKeyboardServer
+from .vive_tracker import ViveTrackerClient, ViveTrackerServer
 from .vuer import VuerClient, VuerServer
 from .x_robotoolkit import XRobotoolkitClient, XRobotoolkitServer
 
@@ -20,6 +21,7 @@ __all__ = [
     "OculusReader",
     "Spacemouse",
     "SshKeyboard",
+    "ViveTracker",
     "Vuer",
     "XRobotoolkit",
 ]

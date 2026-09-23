@@ -74,6 +74,8 @@ sudo ./scripts/setup/spacemouse.sh
 systemctl status spacenavd
 ```
 
+Vive Tracker: [`docs/interfaces/vive_tracker.md`](docs/interfaces/vive_tracker.md)
+
 Vuer: [`docs/interfaces/vuer.md`](docs/interfaces/vuer.md)
 
 XRoboToolkit: [`docs/interfaces/x_robotoolkit.md`](docs/interfaces/x_robotoolkit.md)
