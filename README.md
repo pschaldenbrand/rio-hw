@@ -63,6 +63,8 @@ Gamepad: [`docs/interfaces/gamepad.md`](docs/interfaces/gamepad.md)
 
 Gello: [`docs/interfaces/gello.md`](docs/interfaces/gello.md)
 
+Manus Glove: [`docs/interfaces/manus_glove.md`](docs/interfaces/manus_glove.md)
+
 Oculus Reader (Quest 2): [`rail-berkeley/oculus_reader/README.md`](https://github.com/rail-berkeley/oculus_reader?tab=readme-ov-file#setup-of-the-adb)
 
 Spacemouse:
@@ -87,6 +89,10 @@ Kinova: [`docs/robots/kinova.md`](docs/robots/kinova.md)
 UR: [`docs/robots/ur.md`](docs/robots/ur.md)
 
 XArm [`docs/robots/xarm.md`](docs/robots/xarm.md)
+
+#### Hands
+
+Inspire Hand: [`docs/robots/inspire_hand.md`](docs/robots/inspire_hand.md)
 
 #### Humanoids
 

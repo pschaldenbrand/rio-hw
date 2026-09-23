@@ -3,6 +3,7 @@ from .gamepad import GamepadClient, GamepadServer
 from .gello import GelloClient, GelloServer
 from .joycon import JoyconClient, JoyconServer
 from .keyboard import KeyboardClient, KeyboardServer
+from .manus_glove import ManusGloveClient, ManusGloveServer
 from .oculus_reader import OculusReaderClient, OculusReaderServer
 from .spacemouse import SpacemouseClient, SpacemouseServer
 from .ssh_keyboard import SshKeyboardClient, SshKeyboardServer
@@ -15,6 +16,7 @@ __all__ = [
     "Gello",
     "Joycon",
     "Keyboard",
+    "ManusGlove",
     "OculusReader",
     "Spacemouse",
     "SshKeyboard",
