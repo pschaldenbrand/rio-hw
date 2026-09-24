@@ -112,6 +112,10 @@ robots = [
     "xarm-python-sdk",  # xarm
     "i2rt @ https://github.com/i2rt-robotics/i2rt.git",  # yam
     "pin",  # kassow local IK (task_pos_ik)
+    # libpinocchio 3.8 is linked against urdfdom 4 / tinyxml2 10; bare `pin`
+    # otherwise pulls cmeel-urdfdom 6 and fails at import with missing .so.4.0.
+    "cmeel-urdfdom>=4,<5",
+    "cmeel-tinyxml2==10.0.0",
 ]
 # --- all dependencies ---
 all = [

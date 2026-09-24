@@ -2,17 +2,19 @@
 
 Tested: HTC Vive Tracker 3.0 with two Base Station 2.0 units, SteamVR on Linux, no headset.
 
-Reference: [SteamVR](https://store.steampowered.com/app/250820/SteamVR/), [`pyopenvr`](https://github.com/cmbruns/pyopenvr)
+Reference: [SteamVR](https://store.steampowered.com/app/250820/SteamVR/), `[pyopenvr](https://github.com/cmbruns/pyopenvr)`
 
 SteamVR handles base-station calibration and multi-lighthouse fusion, so the
 `ViveTracker` node only enumerates devices and republishes the pose. It
 publishes in the SteamVR standing frame (Y up, -Z away from the user) as a
 6-vector matching rio's `eef_pose` layout:
 
-| Key | Shape | Meaning |
-| --- | --- | --- |
+
+| Key            | Shape  | Meaning                                                             |
+| -------------- | ------ | ------------------------------------------------------------------- |
 | `tracker_pose` | `(6,)` | `[x, y, z, rx, ry, rz]`, position in meters and axis-angle rotation |
-| `pose_valid` | scalar | `1.0` while SteamVR reports a valid pose, else `0.0` |
+| `pose_valid`   | scalar | `1.0` while SteamVR reports a valid pose, else `0.0`                |
+
 
 The last good pose is republished while tracking is lost so downstream filters
 stay continuous. Consumers must check `pose_valid` and stop commanding motion
@@ -20,9 +22,32 @@ when it drops.
 
 ## Install SteamVR
 
+Warning! On some computers, doing the sudo apt install steam may remove your ubuntu-desktop and nvidia drivers. Before running this, try to simulate it:
+
+```bash
+sudo apt-get -s install steam
+```
+
+If you see "The following pakcages will be REMOVED:" and see ubuntu-desktop, gdm3, gnome-shell, or any nvidia drivers, DO NOT INSTALL WITH APT. Do the directions below
+
 ```bash
 sudo apt update
-sudo apt install steam
+sudo apt install steam # SEE WARNING ABOVE
+```
+
+If apt will uninstall ubuntu-desktop or nvidia-drivers, instead download steam .deb from their website ([https://store.steampowered.com/about/](https://store.steampowered.com/about/))
+
+```bash
+sudo dpkg --add-architecture i386
+sudo apt update
+sudo apt-get -s install ./steam_latest.deb
+# Ensure it won't uninstall ubuntu-desktop and nvidia-drivers. If not, proceed
+sudo apt  install ./steam_latest.deb
+```
+
+Install steam vr
+
+```bash
 steam steam://install/250820
 ```
 
@@ -34,9 +59,8 @@ Use native Steam, not Flatpak or Snap. Launch SteamVR from Steam
 SteamVR needs a null HMD when no headset is attached. Fully quit SteamVR, then:
 
 1. Enable the null driver in
-   `~/.steam/debian-installation/steamapps/common/SteamVR/drivers/null/resources/settings/default.vrsettings`
+  `~/.steam/debian-installation/steamapps/common/SteamVR/drivers/null/resources/settings/default.vrsettings`
    (or `~/.local/share/Steam/...`) by setting `"enable": true`.
-
 2. In `~/.steam/debian-installation/config/steamvr.vrsettings`, make `"steamvr"` include:
 
 ```json
@@ -45,10 +69,12 @@ SteamVR needs a null HMD when no headset is attached. Fully quit SteamVR, then:
 "activateMultipleDrivers": true
 ```
 
-3. Power both base stations, plug in the tracker dongle, power the tracker.
-4. Launch SteamVR and pair via **Devices -> Pair Controller** (tracker LED solid green).
-5. Room setup is not required for tracker poses.
-6. Leave SteamVR running while nodes are up.
+1. Power both base stations, plug in the tracker dongle, power the tracker.
+2. Launch SteamVR and pair via **Devices -> Pair Controller** (tracker LED solid green).
+3. Room setup is not required for tracker poses.
+4. Leave SteamVR running while nodes are up.
+
+
 
 ## Base station channels
 
@@ -107,9 +133,10 @@ standing where you will actually work, and recalibrate if you relocate.
 ## FAQ
 
 - SteamVR shows the tracker but the node reports no trackers: confirm a tracker
-  icon is present rather than only the null HMD, then power-cycle the tracker
-  and replug the dongle.
+icon is present rather than only the null HMD, then power-cycle the tracker
+and replug the dongle.
 - `pose_valid` stays at 0: the tracker is paired but no base station can see
-  it. Check base station power and line of sight.
+it. Check base station power and line of sight.
 - Only one base station appears after a channel fix: give SteamVR a few seconds
-  to re-enumerate, or restart it.
+to re-enumerate, or restart it.
+
