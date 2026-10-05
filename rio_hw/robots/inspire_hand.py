@@ -257,11 +257,16 @@ class InspireHand(Node):
             target_angles: Array-like of shape (6,) with values in [0, 1].
                 Index order: [pinky, ring, middle, index, thumb_flex, thumb_rot].
             target_time: Absolute time (seconds) by which the motion should complete.
-                Must be in the future. Currently used only for queue ordering.
+                Used only for queue ordering; if the teleop loop has already fallen
+                behind schedule, the command is still accepted with a bumped deadline.
         """
         target_angles = np.asarray(target_angles, dtype=self.dtype)
         assert target_angles.shape == (6,), f"Expected shape (6,), got {target_angles.shape}"
-        assert target_time > time.now(), "target_time must be in the future"
+        now = time.now()
+        if target_time <= now:
+            # Teleop at high rate budgets only ~1–2 cycles of lead; a recorder
+            # save or USB hitch can push wall time past that. Keep commanding.
+            target_time = now + 1e-3
         req = {
             "type": RequestType.MOVEH.value,
             "target_angles": target_angles,
